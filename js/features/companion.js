@@ -284,6 +284,11 @@
         return img ? img.src : null;
     }
 
+    function getMyAvatarSrc() {
+        const img = document.querySelector('#my-avatar img,.my-avatar img');
+        return img ? img.src : null;
+    }
+
     function sendChatEvent(icon, label, detail) {
         // 复用原项目通话事件的接口，往聊天里加一条记录
         if (typeof window._addCallEvent === 'function') {
@@ -385,10 +390,12 @@
 
     // ─── 陪伴时长统计 ───────────────────────────────────────────────────────
     let _sessionStartTime = null;   // 进陪伴页时记录
+    let _originalSessionStartTime = null; // 最初的开始时间（不受延长影响）
     let _accumulatedExtendTime = 0; // 之前几段陪伴累计时长（继续陪伴时累加）
 
     function startSessionClock() {
         _sessionStartTime = Date.now();
+        _originalSessionStartTime = Date.now();
         _accumulatedExtendTime = 0;
     }
     function getElapsedSeconds() {
@@ -429,6 +436,7 @@
     // 用户点场景卡 → 先让用户选时间 → 选完后再发起邀请
     async function selectMode(mode) {
         currentMode = mode;
+        window._companionSessionInitiator = 'user'; // 用户主动发起
         closeCompanionModal();
         // 打开时间选择，用户选完后再走邀请等待流程
         openTimeModal(mode, (selectedTime) => {
@@ -447,6 +455,7 @@
     // 梦角发起接受 → 直接进入陪伴页（用梦角说的那个时间）
     function enterWithInviteTime(mode, time) {
         currentMode = mode;
+        window._companionSessionInitiator = 'partner'; // 梦角主动发起
         // 设置时间状态（和 openTimeModal 里点按钮后的逻辑一致）
         if (time === 'rest') {
             isCountdown = false;
@@ -1440,7 +1449,8 @@
 
     // ─── 陪伴页面 ────────────────────────────────────────────────────────────
 
-    function openCompanionPage() {
+    function openCompanionPage(opts) {
+        opts = opts || {};
         const cfg = MODES[currentMode];
         const page = $('companion-page');
 
@@ -1477,7 +1487,10 @@
         document.body.style.overflow = 'hidden';
 
         // 启动会话时钟（统计陪伴时长用）
-        startSessionClock();
+        // 注意：恢复闪退会话时不要重置时钟（保留 resumeFromSession 里设置的 _sessionStartTime）
+        if (!opts.isResume) {
+            startSessionClock();
+        }
 
         // 清空本次陪伴的对话记录
         _sessionDialogue = [];
@@ -1488,7 +1501,7 @@
         // 续播上次的白噪音（如果有）
         resumeLastNoise();
 
-        console.log('[companion] 陪伴页面已打开');
+        console.log('[companion] 陪伴页面已打开' + (opts.isResume ? '（闪退恢复）' : ''));
     }
 
     function renderCompanionBackground(bg) {
@@ -1541,6 +1554,14 @@
         stopPartnerGoodnightCheck();
         recordHistory();
 
+        // 清除闪退恢复用的 live session（陪伴正常结束）
+        try { localforage.removeItem(getLiveSessionKey()).catch(() => {}); } catch (e) {}
+
+        // 计算本次时长 + 写入陪伴日记（在状态被清空之前）
+        const _diaryDurSec = getElapsedSeconds();
+        const _diaryMode = currentMode;
+        const _diaryInitiator = window._companionSessionInitiator === 'partner' ? 'partner' : 'user';
+
         // 默认留痕，除非显式 skipLogEvent
         if (!opts.skipLogEvent) {
             const sceneName = getSceneName();
@@ -1551,6 +1572,25 @@
             // 用场景对应的图标
             const sceneIcon = MODES[currentMode]?.icon || 'fa-moon';
             sendChatEvent(sceneIcon, label, elapsed);
+        }
+
+        // 写入陪伴日记（只有真正陪伴过、且时长 ≥ 30 秒才记录，避免误触）
+        try {
+            if (_diaryMode && _diaryDurSec >= 30 && typeof window.addCompanionDiaryEntry === 'function') {
+                const partnerNote = (typeof window.pickCompanionDiaryCards === 'function')
+                    ? window.pickCompanionDiaryCards()
+                    : '';
+                window.addCompanionDiaryEntry({
+                    ts: Date.now() - _diaryDurSec * 1000, // 用开始时间作为时间戳
+                    mode: _diaryMode,
+                    duration: _diaryDurSec,
+                    initiator: _diaryInitiator,
+                    partnerNote: partnerNote,
+                    userNote: ''
+                });
+            }
+        } catch (e) {
+            console.warn('[companion] write diary error:', e);
         }
 
         // 停止语音
@@ -1569,12 +1609,39 @@
         // 清空会话时钟
         _sessionStartTime = null;
         _accumulatedExtendTime = 0;
+        window._companionSessionInitiator = null;
 
         // 清空本次对话 + 气泡 + typing
         _sessionDialogue = [];
         const bubbleArea = document.getElementById('companion-bubble-area');
         if (bubbleArea) bubbleArea.innerHTML = '';
         hideCompanionTyping();
+
+        // 重置输入区状态（防止下次进来还是展开的）
+        const inputBar = document.getElementById('companion-input-bar');
+        const kbBtn = document.getElementById('companion-keyboard-btn');
+        const inputField = document.getElementById('companion-input-field');
+        if (inputBar) inputBar.classList.remove('visible');
+        if (kbBtn) kbBtn.classList.remove('active');
+        $('companion-page').classList.remove('companion-input-active');
+        if (inputField) inputField.value = '';
+
+        // 把表情面板放回原位置（如果被陪伴页占用了）
+        try {
+            const picker = document.getElementById('user-sticker-picker');
+            if (picker && picker.dataset.companionMoved === '1') {
+                picker.classList.remove('active');
+                picker.style.cssText = ''; // 清除内联样式
+                if (window.__stickerPickerOriginalParent) {
+                    if (window.__stickerPickerOriginalNextSibling) {
+                        window.__stickerPickerOriginalParent.insertBefore(picker, window.__stickerPickerOriginalNextSibling);
+                    } else {
+                        window.__stickerPickerOriginalParent.appendChild(picker);
+                    }
+                }
+                picker.dataset.companionMoved = '0';
+            }
+        } catch (e) { console.warn('[companion] restore picker failed', e); }
     }
 
     // ─── 白噪音 ──────────────────────────────────────────────────────────────
@@ -2092,6 +2159,8 @@
 
         timerInterval = setInterval(() => {
             recomputeTimerFromAnchor();
+            // 每秒触发心跳（节流到 10 秒一次写盘）
+            tryHeartbeatLiveSession();
         }, 1000);
 
         // 切回前台时立即重算一次（修复锁屏/后台时倒计时停止的问题）
@@ -2101,6 +2170,9 @@
             };
             document.addEventListener('visibilitychange', _visibilityHandler);
         }
+
+        // 启动时立刻写入一次完整的 live session（用于闪退恢复）
+        writeLiveSession();
     }
 
     function stopTimer() {
@@ -2113,6 +2185,119 @@
             _visibilityHandler = null;
         }
     }
+
+    // ─── 闪退恢复：live session 持久化 ─────────────────
+    function getLiveSessionKey() {
+        return (typeof getStorageKey === 'function')
+            ? getStorageKey('companionLiveSession')
+            : (window.APP_PREFIX || 'CHAT_APP_V3_') + 'companionLiveSession';
+    }
+    let _lastHeartbeatTs = 0;
+    function writeLiveSession() {
+        try {
+            // 把累计时间合并到 startTs 里：虚拟起点 = 当前段起点 - 累计延长时间
+            // 这样恢复时直接 (Date.now() - startTs) 就是完整陪伴时长
+            const virtualStartTs = _sessionStartTime
+                ? _sessionStartTime - Math.floor((_accumulatedExtendTime || 0) * 1000)
+                : Date.now();
+            const payload = {
+                startTs: virtualStartTs,
+                heartbeatTs: Date.now(),
+                mode: currentMode,
+                initiator: window._companionSessionInitiator === 'partner' ? 'partner' : 'user',
+                isCountdown: !!isCountdown,
+                // 总时长：当前段 + 累计延长（这样剩余时间也对得上）
+                totalSeconds: (totalSeconds || 0) + Math.floor(_accumulatedExtendTime || 0),
+                accumulatedExtendTime: 0  // 已经合并到 startTs 里
+            };
+            localforage.setItem(getLiveSessionKey(), payload).catch(() => {});
+            _lastHeartbeatTs = Date.now();
+        } catch (e) {}
+    }
+    function tryHeartbeatLiveSession() {
+        // 节流：距离上次心跳 < 10 秒就跳过
+        if (Date.now() - _lastHeartbeatTs < 10000) return;
+        writeLiveSession();
+    }
+    function clearLiveSession() {
+        try {
+            // 用扫描方式删除所有 companionLiveSession 相关 key
+            // 不依赖 getLiveSessionKey()，避免 SESSION_ID 异步问题或伪造测试数据残留
+            localforage.keys().then(function(keys) {
+                const targets = keys.filter(function(k) {
+                    return k.indexOf('companionLiveSession') !== -1;
+                });
+                Promise.all(targets.map(function(k) {
+                    return localforage.removeItem(k).catch(function() {});
+                }));
+            }).catch(function() {});
+        } catch (e) {}
+        _lastHeartbeatTs = 0;
+    }
+    // 暴露给外部（启动时检测用）
+    window._companionRecoverModule = {
+        getLiveSessionKey: getLiveSessionKey,
+        clearLiveSession: clearLiveSession,
+        // 用恢复出来的状态继续陪伴
+        resumeFromSession: function(session) {
+            if (!session || !session.mode) return false;
+            try {
+                currentMode = session.mode;
+                window._companionSessionInitiator = session.initiator || 'user';
+                _accumulatedExtendTime = session.accumulatedExtendTime || 0;
+                // 用真实墙上时间算（不暂停）
+                const elapsedSinceStart = Math.floor((Date.now() - session.startTs) / 1000) + _accumulatedExtendTime;
+                if (session.isCountdown) {
+                    isCountdown = true;
+                    totalSeconds = session.totalSeconds;
+                    const remaining = session.totalSeconds - elapsedSinceStart;
+                    if (remaining <= 0) {
+                        // 时间已经过完了 → 让外层去写日记
+                        return false;
+                    }
+                    timerSeconds = remaining;
+                } else {
+                    // 正计时（睡觉）→ 从真实累计时间继续
+                    isCountdown = false;
+                    timerSeconds = elapsedSinceStart;
+                    totalSeconds = 0;
+                }
+                // 把 session 起点追回到原本的起点
+                _sessionStartTime = session.startTs;
+                _accumulatedExtendTime = 0;
+                openCompanionPage({ isResume: true });
+                return true;
+            } catch (e) {
+                console.warn('[companion] resume failed', e);
+                return false;
+            }
+        },
+        // 把会话作为已完成日记保存
+        saveSessionAsDiary: async function(session) {
+            if (!session || !session.mode) return;
+            // 按真实墙上时间算
+            let duration = Math.max(0, Math.floor((Date.now() - session.startTs) / 1000) + (session.accumulatedExtendTime || 0));
+            // 倒计时模式：时长不能超过总时长（时间到了就是到了）
+            if (session.isCountdown && session.totalSeconds && duration > session.totalSeconds) {
+                duration = session.totalSeconds;
+            }
+            if (duration < 30) return; // 太短，不记
+            // 走正常字卡逻辑（30% 不写、70% 抽 1-2 句）
+            const partnerNote = (typeof window.pickCompanionDiaryCards === 'function')
+                ? window.pickCompanionDiaryCards()
+                : '';
+            if (typeof window.addCompanionDiaryEntry === 'function') {
+                await window.addCompanionDiaryEntry({
+                    ts: session.startTs,
+                    mode: session.mode,
+                    duration: duration,
+                    initiator: session.initiator || 'user',
+                    partnerNote: partnerNote,
+                    userNote: ''
+                });
+            }
+        }
+    };
 
     function updateTimerDisplay() {
         const el = $('companion-timer-display');
@@ -2546,6 +2731,20 @@
         showCompanionBubble(message);
     }
 
+    // 钩子：用户在陪伴页发送消息时，气泡同步显示
+    function onUserMessage(message) {
+        const page = document.getElementById('companion-page');
+        if (!page || !page.classList.contains('active')) return;
+        if (!message.text && !message.image) return;
+        // 记录到本次陪伴对话
+        _sessionDialogue.push({
+            text: message.text || '',
+            image: message.image || null,
+            sender: 'user',
+        });
+        showCompanionBubble(message);
+    }
+
     function showCompanionBubble(message) {
         const area = document.getElementById('companion-bubble-area');
         if (!area) return;
@@ -2558,26 +2757,32 @@
             setTimeout(() => { if (oldest.isConnected) oldest.remove(); }, 1000);
         }
 
+        const isUser = message.sender === 'user';
         const bubble = document.createElement('div');
-        bubble.className = 'companion-bubble';
+        bubble.className = 'companion-bubble' + (isUser ? ' companion-bubble-user' : '');
 
-        const avSrc = getPartnerAvatarSrc();
+        // 头像：用户用用户头像，梦角用梦角头像
+        const avSrc = isUser ? getMyAvatarSrc() : getPartnerAvatarSrc();
         const avatarHtml = avSrc
             ? `<img src="${avSrc}">`
             : `<i class="fas fa-user"></i>`;
 
         // 文字 or 图片（sticker）
-        let contentHtml = '';
-        if (message.image) {
-            contentHtml = `<img src="${message.image}">`;
+        // 文字 → 装在气泡里（带背景圆角）
+        // 图片/表情 → 不要气泡容器，直接显示原图（跟主页一样）
+        const isImage = !!message.image;
+        if (isImage) {
+            bubble.classList.add('companion-bubble-image');
+            bubble.innerHTML = `
+                <div class="companion-bubble-avatar">${avatarHtml}</div>
+                <img class="companion-bubble-image-raw" src="${message.image}">
+            `;
         } else {
-            contentHtml = escapeHtml(message.text || '');
+            bubble.innerHTML = `
+                <div class="companion-bubble-avatar">${avatarHtml}</div>
+                <div class="companion-bubble-content">${escapeHtml(message.text || '')}</div>
+            `;
         }
-
-        bubble.innerHTML = `
-            <div class="companion-bubble-avatar">${avatarHtml}</div>
-            <div class="companion-bubble-content">${contentHtml}</div>
-        `;
         area.appendChild(bubble);
 
         // 8 秒显示后启动 2s 渐隐 → 共 10s
@@ -2638,22 +2843,34 @@
         modal.id = 'companion-history-modal';
         modal.className = 'companion-history-modal active';
 
-        const partnerName = getPartnerName();
-        const avSrc = getPartnerAvatarSrc();
-        const avatarHtml = avSrc ? `<img src="${avSrc}">` : `<i class="fas fa-user"></i>`;
+        const partnerAvSrc = getPartnerAvatarSrc();
+        const partnerAvatarHtml = partnerAvSrc ? `<img src="${partnerAvSrc}">` : `<i class="fas fa-user"></i>`;
+        const userAvSrc = getMyAvatarSrc();
+        const userAvatarHtml = userAvSrc ? `<img src="${userAvSrc}">` : `<i class="fas fa-user"></i>`;
 
         let listHtml = '';
         if (_sessionDialogue.length === 0) {
             listHtml = `<div class="companion-history-empty">暂无对话</div>`;
         } else {
             listHtml = _sessionDialogue.map(m => {
-                const contentHtml = m.image
-                    ? `<img src="${m.image}">`
-                    : escapeHtml(m.text || '');
+                const isUser = m.sender === 'user';
+                const avatarHtml = isUser ? userAvatarHtml : partnerAvatarHtml;
+                const itemClass = isUser
+                    ? 'companion-history-item companion-history-item-user'
+                    : 'companion-history-item';
+                // 图片/表情 → 不装气泡，直接显示原图（跟陪伴页气泡一致）
+                if (m.image) {
+                    return `
+                        <div class="${itemClass} companion-history-item-image">
+                            <div class="companion-bubble-avatar">${avatarHtml}</div>
+                            <img class="companion-bubble-image-raw" src="${m.image}">
+                        </div>
+                    `;
+                }
                 return `
-                    <div class="companion-history-item">
+                    <div class="${itemClass}">
                         <div class="companion-bubble-avatar">${avatarHtml}</div>
-                        <div class="companion-bubble-content">${contentHtml}</div>
+                        <div class="companion-bubble-content">${escapeHtml(m.text || '')}</div>
                     </div>
                 `;
             }).join('');
@@ -2676,12 +2893,16 @@
         modal.querySelector('.companion-history-close').addEventListener('click', () => {
             modal.classList.remove('active');
             setTimeout(() => { if (modal.isConnected) modal.remove(); }, 300);
+            const historyBtn = document.getElementById('companion-history-btn');
+            if (historyBtn) historyBtn.classList.remove('active');
         });
         // 点背景关闭
         modal.addEventListener('click', (e) => {
             if (e.target === modal) {
                 modal.classList.remove('active');
                 setTimeout(() => { if (modal.isConnected) modal.remove(); }, 300);
+                const historyBtn = document.getElementById('companion-history-btn');
+                if (historyBtn) historyBtn.classList.remove('active');
             }
         });
 
@@ -3273,17 +3494,198 @@
         if (historyBtn) {
             historyBtn.addEventListener('click', (e) => {
                 e.stopPropagation();  // 阻止冒泡
+                historyBtn.classList.add('active');
                 openCompanionHistory();
             });
         }
 
         // 注册"梦角说话"钩子 — core.js addMessage 末尾会调用
         window._onPartnerMessage = onPartnerMessage;
+        // 注册"用户说话"钩子（陪伴页气泡同步显示用户消息）
+        window._onUserMessage = onUserMessage;
 
         // 监听首页 typing-indicator 的显示/隐藏，同步到陪伴页
         watchTypingIndicator();
 
+        // ── 键盘按钮 + 输入区绑定 ───────────────────────────────
+        bindCompanionInputBar();
+
         // 设置面板入口和相关元素已移除（统一去外观设置 → 背景&字体 管理）
+    }
+
+    // ─── 陪伴输入区逻辑 ─────────────────────────────────────
+    function bindCompanionInputBar() {
+        const kbBtn = document.getElementById('companion-keyboard-btn');
+        const bar = document.getElementById('companion-input-bar');
+        const field = document.getElementById('companion-input-field');
+        const emojiBtn = document.getElementById('companion-emoji-btn');
+        const imageBtn = document.getElementById('companion-image-btn');
+        const page = document.getElementById('companion-page');
+        if (!kbBtn || !bar || !field || !page) return;
+
+        // 切换显示/隐藏
+        kbBtn.addEventListener('click', () => {
+            const isVisible = bar.classList.contains('visible');
+            if (isVisible) {
+                bar.classList.remove('visible');
+                kbBtn.classList.remove('active');
+                page.classList.remove('companion-input-active');
+                field.blur();
+                // 收起时也关闭表情面板
+                const picker = document.getElementById('user-sticker-picker');
+                if (picker) picker.classList.remove('active');
+            } else {
+                bar.classList.add('visible');
+                kbBtn.classList.add('active');
+                page.classList.add('companion-input-active');
+                setTimeout(() => field.focus(), 50);
+            }
+        });
+
+        // 回车发送
+        field.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                doCompanionSend();
+            }
+        });
+
+        // 表情包按钮 → 触发主聊天的表情面板，并把面板移到陪伴页里浮起来显示
+        emojiBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            try {
+                const mainComboBtn = document.getElementById('combo-btn');
+                const picker = document.getElementById('user-sticker-picker');
+                if (!mainComboBtn || !picker) {
+                    if (typeof showNotification === 'function') showNotification('表情功能加载失败', 'error');
+                    return;
+                }
+
+                // 已经在陪伴页里显示 → 收起
+                if (picker.dataset.companionMoved === '1' && picker.classList.contains('active')) {
+                    picker.classList.remove('active');
+                    picker.style.display = 'none';
+                    return;
+                }
+
+                // 先记录原位置（第一次移动时）
+                if (picker.dataset.companionMoved !== '1') {
+                    window.__stickerPickerOriginalParent = picker.parentNode;
+                    window.__stickerPickerOriginalNextSibling = picker.nextSibling;
+                }
+
+                // 触发主聊天的初始化逻辑（让面板内容渲染好）
+                mainComboBtn.click();
+
+                // 物理移到陪伴页里
+                const companionPage = document.getElementById('companion-page');
+                if (companionPage) {
+                    companionPage.appendChild(picker);
+                    picker.dataset.companionMoved = '1';
+                    picker.classList.add('active');
+                    // 浮在陪伴输入区上方 + 圆角
+                    picker.style.cssText = 'position: absolute !important; left: 16px !important; right: 16px !important; bottom: 80px !important; top: auto !important; width: auto !important; max-width: none !important; max-height: 320px !important; z-index: 200 !important; display: flex !important; border-radius: 16px !important; overflow: hidden !important; box-shadow: 0 8px 32px rgba(0,0,0,0.25) !important;';
+
+                    // 关闭逻辑已统一到 document-level（在外面注册），这里不重复绑定
+                }
+            } catch (e) { console.warn('[companion] emoji click failed', e); }
+        });
+
+        // ── 表情面板统一关闭逻辑 ───────────────────────────────
+        if (!window.__companionStickerCloseInstalled) {
+            document.addEventListener('click', (e) => {
+                const picker = document.getElementById('user-sticker-picker');
+                if (!picker || picker.dataset.companionMoved !== '1') return;
+                if (!picker.classList.contains('active')) return;
+                const target = e.target;
+                if (!target) return;
+
+                // 点在面板内：判断是否要关闭
+                if (target.closest('#user-sticker-picker')) {
+                    // 排除：tab 切换、添加按钮、头部、上传 input 等
+                    if (target.closest('.combo-tab-btn') ||
+                        target.closest('.sticker-grid-add') ||
+                        target.closest('.combo-tabs-header') ||
+                        target.closest('.sticker-delete-btn') ||
+                        target.tagName === 'INPUT') {
+                        return;
+                    }
+                    // 点表情图片本身（IMG）或者表情 item 容器 → 立即隐藏面板（发送照常进行）
+                    if (target.tagName === 'IMG' ||
+                        target.closest('.sticker-grid-item') ||
+                        target.closest('.picker-item') ||
+                        target.closest('.poke-item')) {
+                        // 立即隐藏（让用户感觉点了就发了）
+                        picker.classList.remove('active');
+                        picker.style.display = 'none';
+                    }
+                    return;
+                }
+
+                // 点表情按钮本身 → 让它自己 toggle
+                if (target.closest('#companion-emoji-btn')) return;
+
+                // 点了其他地方 → 立即关闭
+                picker.classList.remove('active');
+                picker.style.display = 'none';
+            }, true);
+            window.__companionStickerCloseInstalled = true;
+        }
+
+        // 输入框获得焦点 → 关闭表情面板
+        field.addEventListener('focus', () => {
+            const picker = document.getElementById('user-sticker-picker');
+            if (picker && picker.dataset.companionMoved === '1' && picker.classList.contains('active')) {
+                picker.classList.remove('active');
+                picker.style.display = 'none';
+            }
+        });
+
+        // 图片按钮 → 触发主聊天的图片输入
+        imageBtn.addEventListener('click', () => {
+            try {
+                const mainImageInput = document.getElementById('image-input');
+                if (mainImageInput) mainImageInput.click();
+                else if (typeof showNotification === 'function') {
+                    showNotification('图片功能加载失败', 'error');
+                }
+            } catch (e) { console.warn('[companion] image click failed', e); }
+        });
+    }
+
+    function doCompanionSend() {
+        const field = document.getElementById('companion-input-field');
+        if (!field) return;
+        const text = (field.value || '').trim();
+        if (!text) return;
+
+        try {
+            // 把文字塞进主输入框
+            const mainInput = document.getElementById('message-input')
+                || document.querySelector('.message-input');
+            if (!mainInput) {
+                console.warn('[companion] 找不到主输入框');
+                return;
+            }
+            mainInput.value = text;
+
+            // 触发主聊天的发送按钮
+            const mainSendBtn = document.getElementById('send-btn')
+                || document.querySelector('[data-action="send"]');
+            if (mainSendBtn) {
+                mainSendBtn.click();
+            } else {
+                // 兜底：触发 input 的回车
+                const ev = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
+                mainInput.dispatchEvent(ev);
+            }
+        } catch (e) {
+            console.warn('[companion] send failed', e);
+        }
+
+        // 清空陪伴输入框
+        field.value = '';
+        field.focus();
     }
 
     // ─── 入口 ────────────────────────────────────────────────────────────────
