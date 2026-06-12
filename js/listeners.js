@@ -1247,6 +1247,7 @@ if (_chatSettingsEl) _chatSettingsEl.addEventListener('click', () => {
                 window.hideAppearancePanel && window.hideAppearancePanel();
                 renderBackgroundGallery();
                 renderThemeSchemesList();
+                if (typeof window.renderDiaryBgGallery === 'function') window.renderDiaryBgGallery();
                 
                 const fontSizeSliderEl = document.getElementById('font-size-slider');
                 const fontSizeValueEl = document.getElementById('font-size-value');
