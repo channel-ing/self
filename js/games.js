@@ -890,10 +890,32 @@ function renderFavorites() {
     });
 
     // 语音条点击播放
+    let _favCurrentAudio = null;
+    let _favCurrentBtn = null;
+
     list.querySelectorAll('.fav-voice-btn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
             e.stopPropagation();
-            if (btn.dataset.playing === '1') return;
+            if (btn.dataset.playing === '1') {
+                // 点同一个正在播的 → 暂停
+                if (_favCurrentAudio) { _favCurrentAudio.pause(); _favCurrentAudio = null; }
+                btn.dataset.playing = '0';
+                btn.style.opacity = '1';
+                _favCurrentBtn = null;
+                return;
+            }
+
+            // 停掉正在播的其他语音
+            if (_favCurrentAudio) {
+                _favCurrentAudio.pause();
+                _favCurrentAudio = null;
+            }
+            if (_favCurrentBtn && _favCurrentBtn !== btn) {
+                _favCurrentBtn.dataset.playing = '0';
+                _favCurrentBtn.style.opacity = '1';
+                _favCurrentBtn = null;
+            }
+
             if (!window.voiceTTS || !window.voiceTTS.isTtsReady()) {
                 if (typeof showNotification === 'function') showNotification('请先在聊天设置里配置真实语音', 'info');
                 return;
@@ -903,15 +925,47 @@ function renderFavorites() {
             if (!fakeText) return;
             btn.dataset.playing = '1';
             btn.style.opacity = '0.6';
+            _favCurrentBtn = btn;
             try {
-                const audioUrl = await window.voiceTTS.getAudioForMessage(msgId, fakeText);
+                let audioUrl = null;
+
+                // 先查 IndexedDB 持久化缓存
+                try {
+                    const base64 = await localforage.getItem(`favAudio_${msgId}`);
+                    if (base64 && typeof base64 === 'string') {
+                        const binary = atob(base64);
+                        const bytes = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                        const blob = new Blob([bytes], { type: 'audio/mpeg' });
+                        audioUrl = URL.createObjectURL(blob);
+                    }
+                } catch (e) {}
+
+                // 没有缓存就正常请求 TTS
+                if (!audioUrl) {
+                    audioUrl = await window.voiceTTS.getAudioForMessage(msgId, fakeText);
+                }
+
+                // 加载期间可能已经被别的点击停掉了
+                if (_favCurrentBtn !== btn) return;
+
                 const audio = new Audio(audioUrl);
+                _favCurrentAudio = audio;
                 audio.play();
-                audio.onended = () => { btn.dataset.playing = '0'; btn.style.opacity = '1'; };
-                audio.onerror = () => { btn.dataset.playing = '0'; btn.style.opacity = '1'; };
+                audio.onended = () => {
+                    btn.dataset.playing = '0';
+                    btn.style.opacity = '1';
+                    if (_favCurrentBtn === btn) { _favCurrentBtn = null; _favCurrentAudio = null; }
+                };
+                audio.onerror = () => {
+                    btn.dataset.playing = '0';
+                    btn.style.opacity = '1';
+                    if (_favCurrentBtn === btn) { _favCurrentBtn = null; _favCurrentAudio = null; }
+                };
             } catch (err) {
                 btn.dataset.playing = '0';
                 btn.style.opacity = '1';
+                if (_favCurrentBtn === btn) { _favCurrentBtn = null; _favCurrentAudio = null; }
                 console.error('[fav voice]', err);
             }
         });
