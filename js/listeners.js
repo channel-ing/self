@@ -21,6 +21,76 @@ function setupEventListeners() {
 }
 
 function initChatActionListeners() {
+
+            // ── 长按显示工具栏 ──────────────────────────────────────────
+            let _longPressTimer = null;
+            let _longPressTriggered = false;
+            const LONG_PRESS_MS = 500;
+
+            function _hideAllActions() {
+                document.querySelectorAll('.message-wrapper.actions-visible').forEach(w => {
+                    w.classList.remove('actions-visible');
+                });
+            }
+
+            DOMElements.chatContainer.addEventListener('touchstart', (e) => {
+                const wrapper = e.target.closest('.message-wrapper');
+                if (!wrapper) return;
+                // 点到工具栏按钮本身，不触发长按
+                if (e.target.closest('.message-meta-actions')) return;
+                _longPressTriggered = false;
+                _longPressTimer = setTimeout(() => {
+                    _longPressTriggered = true;
+                    _hideAllActions();
+                    wrapper.classList.add('actions-visible');
+                    // 阻止文字选中
+                    if (window.getSelection) window.getSelection().removeAllRanges();
+                    // 触觉反馈
+                    if (navigator.vibrate) navigator.vibrate(30);
+                }, LONG_PRESS_MS);
+            }, { passive: false });
+
+            DOMElements.chatContainer.addEventListener('touchend', (e) => {
+                clearTimeout(_longPressTimer);
+                _longPressTimer = null;
+            }, { passive: true });
+
+            DOMElements.chatContainer.addEventListener('touchmove', (e) => {
+                clearTimeout(_longPressTimer);
+                _longPressTimer = null;
+            }, { passive: true });
+
+            // 点击空白处收起工具栏
+            document.addEventListener('click', (e) => {
+                if (!e.target.closest('.message-wrapper')) {
+                    _hideAllActions();
+                }
+            });
+
+            // ── 点击语音条直接播放 ─────────────────────────────────────
+            DOMElements.chatContainer.addEventListener('click', (e) => {
+                // 如果是长按触发的，忽略随后的click
+                if (_longPressTriggered) {
+                    _longPressTriggered = false;
+                    return;
+                }
+
+                const voiceBubble = e.target.closest('.voice-bubble');
+                if (voiceBubble) {
+                    // 直接触发voice-bubble的点击（listeners-voice.js里已有逻辑）
+                    return;
+                }
+
+                // 点击气泡本身（非工具栏）不做任何事
+                const wrapper = e.target.closest('.message-wrapper');
+                if (wrapper && !e.target.closest('.message-meta-actions') && !e.target.closest('.voice-bubble')) {
+                    // 收起工具栏
+                    if (wrapper.classList.contains('actions-visible')) {
+                        wrapper.classList.remove('actions-visible');
+                    }
+                }
+            });
+
             DOMElements.chatContainer.addEventListener('click', (e) => {
 
                 if (isBatchFavoriteMode) {
@@ -482,19 +552,40 @@ if (_chatSettingsEl) _chatSettingsEl.addEventListener('click', () => {
     if (pokeMyName) pokeMyName.textContent = settings.myName || '我';
     if (pokePartnerName) pokePartnerName.textContent = settings.partnerName || '对方';
     if (pokePreview) pokePreview.textContent = `${settings.myName || '我'} ${settings.myPokeText || '拍了拍'} ${settings.partnerName || '对方'}`;
-    // 实时预览更新
+
+    // 保存按钮 dirty 状态
+    const myPokeSaveBtn = document.getElementById('my-poke-text-save');
+    function _applyPokeSaveBtnState(isDirty) {
+        if (!myPokeSaveBtn) return;
+        myPokeSaveBtn.disabled = !isDirty;
+        myPokeSaveBtn.textContent = isDirty ? '保存' : '已保存';
+        myPokeSaveBtn.style.background = isDirty ? 'var(--accent-color)' : 'var(--border-color)';
+        myPokeSaveBtn.style.color = isDirty ? '#fff' : 'var(--text-secondary)';
+        myPokeSaveBtn.style.cursor = isDirty ? 'pointer' : 'not-allowed';
+        myPokeSaveBtn.style.opacity = isDirty ? '1' : '0.65';
+    }
+
+    // 初始状态：已保存（未修改）
+    _applyPokeSaveBtnState(false);
+
+    // 实时预览更新 + dirty 检测
     if (myPokeTextInput) {
         myPokeTextInput.oninput = () => {
             const verb = myPokeTextInput.value.trim() || '拍了拍';
             if (pokePreview) pokePreview.textContent = `${settings.myName || '我'} ${verb} ${settings.partnerName || '对方'}`;
+            // 跟已保存值比较
+            const isDirty = myPokeTextInput.value.trim() !== (settings.myPokeText || '');
+            _applyPokeSaveBtnState(isDirty);
         };
     }
+
     // 保存按钮
-    const myPokeSaveBtn = document.getElementById('my-poke-text-save');
     if (myPokeSaveBtn) {
         myPokeSaveBtn.onclick = () => {
+            if (myPokeSaveBtn.disabled) return;
             settings.myPokeText = myPokeTextInput ? myPokeTextInput.value.trim() : '';
             throttledSaveData();
+            _applyPokeSaveBtnState(false);
             if (typeof showNotification === 'function') showNotification('已保存', 'success', 1500);
         };
     }

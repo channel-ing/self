@@ -917,6 +917,9 @@
             gap: 10px;
             align-items: var(--avatar-align, flex-end);
             flex-shrink: 0;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-touch-callout: none;
         }
         .message-avatar {
             width: var(--in-chat-avatar-size);
@@ -1038,10 +1041,12 @@
             transform: translateY(5px);
             transition: var(--transition);
             z-index: 2;
+            pointer-events: none;
         }
-        .message-content-wrapper:hover .message-meta-actions {
+        .message-wrapper.actions-visible .message-meta-actions {
             opacity: 1;
             transform: translateY(0);
+            pointer-events: auto;
         }
         .message-wrapper.sent .message-meta-actions {
             left: 0;
