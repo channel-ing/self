@@ -685,12 +685,23 @@ function selectCompanionMode(mode) {
 
     function _normalizeTtsConfig(cfg) {
         cfg = cfg || {};
+        let speed;
+        if (cfg.speed === undefined || cfg.speed === null || cfg.speed === '') {
+            speed = 1.0;
+        } else {
+            speed = Number(cfg.speed);
+            if (!isFinite(speed)) speed = 1.0;
+        }
+        speed = Math.max(0.5, Math.min(2.0, speed));
         return {
             minimaxKey: String(cfg.minimaxKey || '').trim(),
             groupId: String(cfg.groupId || '').trim(),
             model: String(cfg.model || 'speech-02-turbo').trim() || 'speech-02-turbo',
             voiceId: String(cfg.voiceId || '').trim(),
-            targetLang: String(cfg.targetLang || 'JA').trim() || 'JA'
+            targetLang: String(cfg.targetLang || 'JA').trim() || 'JA',
+            gender: String(cfg.gender || 'male').trim() || 'male',
+            styleText: String(cfg.styleText || '').trim(),
+            speed: speed
         };
     }
 
@@ -700,7 +711,10 @@ function selectCompanionMode(mode) {
             groupId: document.getElementById('tts-group-id')?.value,
             model: document.getElementById('tts-model')?.value,
             voiceId: document.getElementById('tts-voice-id')?.value,
-            targetLang: _getSelectedTtsLang()
+            targetLang: _getSelectedTtsLang(),
+            gender: document.querySelector('.tts-gender-btn.active')?.dataset.gender || 'male',
+            styleText: (document.getElementById('tts-style-text')?.value || '').trim(),
+            speed: document.getElementById('tts-speed')?.value
         });
     }
 
@@ -711,7 +725,10 @@ function selectCompanionMode(mode) {
             left.groupId === right.groupId &&
             left.model === right.model &&
             left.voiceId === right.voiceId &&
-            left.targetLang === right.targetLang;
+            left.targetLang === right.targetLang &&
+            left.gender === right.gender &&
+            left.styleText === right.styleText &&
+            left.speed === right.speed;
     }
 
     function _paintTtsLangButtons(selectedLang) {
@@ -723,6 +740,9 @@ function selectCompanionMode(mode) {
             btn.style.color = isActive ? 'var(--accent-color)' : 'var(--text-secondary)';
             btn.style.fontWeight = isActive ? '600' : 'normal';
         });
+        // 选原文时隐藏翻译选项
+        const translateOpts = document.getElementById('tts-translate-options');
+        if (translateOpts) translateOpts.style.display = selectedLang === 'RAW' ? 'none' : '';
     }
 
     function _getSelectedTtsLang() {
@@ -783,12 +803,72 @@ function selectCompanionMode(mode) {
         const gId   = document.getElementById('tts-group-id');
         const model = document.getElementById('tts-model');
         const vId   = document.getElementById('tts-voice-id');
+        const styleText = document.getElementById('tts-style-text');
+        const styleCount = document.getElementById('tts-style-count');
+        const speedEl   = document.getElementById('tts-speed');
+        const speedInput = document.getElementById('tts-speed-value'); // 现在是 input 不是 span
         if (mKey)  mKey.value  = cfg.minimaxKey;
         if (gId)   gId.value   = cfg.groupId;
         if (model) model.value = cfg.model;
         if (vId)   vId.value   = cfg.voiceId;
+        if (styleText) { styleText.value = cfg.styleText || ''; }
+        if (styleCount) styleCount.textContent = (cfg.styleText || '').length;
+        if (speedEl)    speedEl.value = String(cfg.speed);
+        if (speedInput) speedInput.value = cfg.speed.toFixed(2);
+        // 滑块 ↔ 输入框双向同步 + dirty 检测（只绑一次）
+        if (speedEl && !speedEl.dataset.bound) {
+            speedEl.dataset.bound = '1';
+            speedEl.addEventListener('input', () => {
+                // 拖滑块 → 同步到输入框
+                if (speedInput) speedInput.value = Number(speedEl.value).toFixed(2);
+                _checkTtsDirty();
+            });
+        }
+        if (speedInput && !speedInput.dataset.bound) {
+            speedInput.dataset.bound = '1';
+            // 输入框变化时 → 同步到滑块
+            // 用 input 事件实时同步；用 change/blur 时做边界夹紧（避免打字打到一半被改值）
+            speedInput.addEventListener('input', () => {
+                const v = Number(speedInput.value);
+                if (isFinite(v) && speedEl) {
+                    // 实时反映到滑块（不强制夹边界，让用户继续打字）
+                    speedEl.value = String(Math.max(0.5, Math.min(2, v)));
+                }
+                _checkTtsDirty();
+            });
+            const clampInput = () => {
+                let v = Number(speedInput.value);
+                if (!isFinite(v) || speedInput.value === '') v = 1.0;
+                v = Math.max(0.5, Math.min(2, v));
+                // 四舍五入到 0.01
+                v = Math.round(v * 100) / 100;
+                speedInput.value = v.toFixed(2);
+                if (speedEl) speedEl.value = String(v);
+                _checkTtsDirty();
+            };
+            speedInput.addEventListener('change', clampInput);
+            speedInput.addEventListener('blur', clampInput);
+            // 回车直接确认（防止表单意外提交）
+            speedInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    clampInput();
+                    speedInput.blur();
+                }
+            });
+        }
         _lastSavedTtsConfig = cfg;
         _paintTtsLangButtons(cfg.targetLang);
+        // 性别按钮高亮
+        const savedGender = cfg.gender || 'male';
+        document.querySelectorAll('.tts-gender-btn').forEach(btn => {
+            const isActive = btn.dataset.gender === savedGender;
+            btn.classList.toggle('active', isActive);
+            btn.style.border = isActive ? '1px solid var(--accent-color)' : '1px solid var(--border-color)';
+            btn.style.background = isActive ? 'rgba(var(--accent-color-rgb),0.1)' : 'transparent';
+            btn.style.color = isActive ? 'var(--accent-color)' : 'var(--text-secondary)';
+            btn.style.fontWeight = isActive ? '600' : 'normal';
+        });
         _bindTtsFieldListeners();
         _setTtsDirty(false);
     }
@@ -817,17 +897,112 @@ function selectCompanionMode(mode) {
         _checkTtsDirty();
     };
 
+    // ─── 性别切换 ───
+    window._setTtsGender = function(gender, btn) {
+        document.querySelectorAll('.tts-gender-btn').forEach(b => {
+            const isActive = b === btn;
+            b.classList.toggle('active', isActive);
+            b.style.border = isActive ? '1px solid var(--accent-color)' : '1px solid var(--border-color)';
+            b.style.background = isActive ? 'rgba(var(--accent-color-rgb),0.1)' : 'transparent';
+            b.style.color = isActive ? 'var(--accent-color)' : 'var(--text-secondary)';
+            b.style.fontWeight = isActive ? '600' : 'normal';
+        });
+        _checkTtsDirty();
+    };
+
+    // ─── 风格预设 ───
+    window._setTtsStylePreset = function(btn) {
+        const styleText = document.getElementById('tts-style-text');
+        const styleCount = document.getElementById('tts-style-count');
+        if (styleText) {
+            styleText.value = btn.dataset.style || '';
+            if (styleCount) styleCount.textContent = styleText.value.length;
+        }
+        _checkTtsDirty();
+    };
+
     // ─── 保存配置 ───
     window._saveTtsConfig = function () {
         if (!window.voiceTTS || !_ttsConfigDirty) return;
         const cfg = _readTtsFormConfig();
-        window.voiceTTS.saveTtsConfig(cfg.minimaxKey, cfg.groupId, cfg.voiceId, cfg.model, cfg.targetLang);
+        window.voiceTTS.saveTtsConfig(cfg.minimaxKey, cfg.groupId, cfg.voiceId, cfg.model, cfg.targetLang, cfg.gender, cfg.styleText, cfg.speed);
         _lastSavedTtsConfig = cfg;
         _setTtsDirty(false);
+        // 清掉内存缓存，让下次点击用新设置重新翻译+TTS
+        // 注意：IndexedDB 里的收藏音频不动
+        if (window.voiceTTS.clearMemoryCache) window.voiceTTS.clearMemoryCache();
         if (typeof showNotification === 'function') {
-            showNotification('配置已保存', 'success');
+            showNotification('配置已保存，语音缓存已重置', 'success');
         }
     };
+
+    // ─── 试听：用当前表单状态合成测试句，按滑块语速本地播放 ───
+    // 不读 / 不写 localStorage，所以可以在「保存」之前就听到效果。
+    let _speedPreviewAudio = null;
+    window._previewTts = async function () {
+        if (!window.voiceTTS) return;
+        const btn   = document.getElementById('tts-preview-btn');
+        const label = document.getElementById('tts-preview-label');
+        const speedEl = document.getElementById('tts-speed');
+
+        // 正在播放 → 再点一次=停止
+        if (_speedPreviewAudio && !_speedPreviewAudio.paused) {
+            try { _speedPreviewAudio.pause(); } catch (_) {}
+            _speedPreviewAudio = null;
+            if (label) label.textContent = '试听';
+            return;
+        }
+
+        const cfg = _readTtsFormConfig();
+        if (!cfg.minimaxKey || !cfg.groupId || !cfg.voiceId) {
+            if (typeof showNotification === 'function') {
+                showNotification('请先填写 MiniMax Key、Group ID 和 Voice ID', 'error');
+            }
+            return;
+        }
+
+        if (btn) btn.disabled = true;
+        if (label) label.textContent = '生成中…';
+
+        try {
+            const audioUrl = await window.voiceTTS.previewWithConfig(cfg);
+            const audio = new Audio(audioUrl);
+            // 按滑块当前值（未保存）应用语速 + 保留音调
+            const currentSpeed = speedEl ? Number(speedEl.value) : cfg.speed;
+            window.voiceTTS.applyPlaybackSettings(audio, currentSpeed);
+            _speedPreviewAudio = audio;
+            if (label) label.textContent = '播放中';
+            audio.onended = () => {
+                if (label) label.textContent = '试听';
+                if (_speedPreviewAudio === audio) _speedPreviewAudio = null;
+            };
+            audio.onerror = () => {
+                if (label) label.textContent = '试听';
+                if (_speedPreviewAudio === audio) _speedPreviewAudio = null;
+                if (typeof showNotification === 'function') showNotification('试听播放失败', 'error');
+            };
+            await audio.play();
+        } catch (err) {
+            console.error('[tts-preview]', err);
+            if (label) label.textContent = '试听';
+            if (typeof showNotification === 'function') {
+                showNotification('试听失败：' + (err.message || '未知错误'), 'error');
+            }
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    };
+
+    // 拖动滑块或输入数字时，如果正在播放试听，实时改变播放速度（即时反馈）
+    document.addEventListener('input', (e) => {
+        if (!_speedPreviewAudio || !window.voiceTTS) return;
+        if (e.target && (e.target.id === 'tts-speed' || e.target.id === 'tts-speed-value')) {
+            const v = Number(e.target.value);
+            if (isFinite(v)) {
+                window.voiceTTS.applyPlaybackSettings(_speedPreviewAudio, Math.max(0.5, Math.min(2, v)));
+            }
+        }
+    });
 
     // ─── 聊天设置打开时初始化 ───
     const chatModal = document.getElementById('chat-modal');

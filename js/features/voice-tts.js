@@ -16,6 +16,22 @@
 
     // ─────────── 内存缓存：避免重复点击时反复请求接口 ───────────
     const _audioCache = {};
+    const _audioCacheOrder = []; // 记录插入顺序，用于 LRU
+    const AUDIO_CACHE_LIMIT = 30;
+
+    function _setAudioCache(key, url) {
+        if (_audioCache[key]) return; // 已有就不重复
+        _audioCache[key] = url;
+        _audioCacheOrder.push(key);
+        // 超出限制时删最旧的
+        if (_audioCacheOrder.length > AUDIO_CACHE_LIMIT) {
+            const oldKey = _audioCacheOrder.shift();
+            if (_audioCache[oldKey]) {
+                URL.revokeObjectURL(_audioCache[oldKey]); // 释放内存
+                delete _audioCache[oldKey];
+            }
+        }
+    }
     const _audioPending = {};
     const _translationCache = {};
     const _translationPending = {};
@@ -34,15 +50,25 @@
 
     function getTtsConfig() { return _getConfig(); }
 
-    function saveTtsConfig(minimaxKey, groupId, voiceId, model, maybeTargetLang, legacyTargetLang) {
-        // Backward compatible with the older six-argument save signature.
-        const targetLang = legacyTargetLang || maybeTargetLang || 'JA';
+    function saveTtsConfig(minimaxKey, groupId, voiceId, model, targetLang, gender, styleText, speed) {
+        // speed 边界：MiniMax 官方支持 0.5–2.0
+        let s;
+        if (speed === undefined || speed === null || speed === '') {
+            s = 1.0;
+        } else {
+            s = Number(speed);
+            if (!isFinite(s)) s = 1.0;
+        }
+        s = Math.max(0.5, Math.min(2.0, s));
         _saveConfig({
             minimaxKey,
             groupId,
             voiceId,
             model: model || DEFAULT_TTS_MODEL,
-            targetLang: targetLang || 'JA'
+            targetLang: targetLang || 'JA',
+            gender: gender || 'male',
+            styleText: styleText || '',
+            speed: s
         });
     }
 
@@ -154,8 +180,42 @@
         return TARGET_LANG_INFO[lang] || TARGET_LANG_INFO.JA;
     }
 
+    function _getGenderInstruction(lang, gender) {
+        const isMale = gender === 'male';
+        const instructions = {
+            JA: isMale
+                ? 'Use masculine Japanese speech: first person 「俺」, sentence-final 「だ」「ぞ」「な」「よ」, commands like 「〜てくれ」「〜しろ」. No honorifics.'
+                : 'Use feminine Japanese speech: first person 「私」「あたし」, sentence-final 「わ」「の」「よね」「かしら」. No honorifics.',
+            KO: isMale
+                ? 'Use informal masculine Korean speech patterns. Use 나 for first person.'
+                : 'Use informal feminine Korean speech patterns. Use 나/저 for first person.',
+            EN: isMale
+                ? 'Use casual masculine English. Direct and confident tone.'
+                : 'Use casual feminine English. Warm and expressive tone.',
+            DE: isMale
+                ? 'Use informal masculine German. Direct du-form.'
+                : 'Use informal feminine German. Warm du-form.',
+        };
+        return instructions[lang] || instructions.JA;
+    }
+
     function _getTtsLanguageBoost(lang) {
+        // 原文模式：按中文发音规则念，不能掉进 JA 兜底
+        if (lang === 'RAW') return 'Chinese';
         return _getLangInfo(lang).ttsBoost || 'auto';
+    }
+
+    // 根据要发送给 TTS 的文本动态决定 language_boost：
+    // 配的是日/韩，但文本里完全没有假名/韩字、却含汉字 → 说明发出去的其实是中文
+    // （常见于翻译失败回退到原文），这时按 Chinese 念，避免出现 nayishi 这种鬼读音
+    function _detectActualLangBoost(text, configuredBoost) {
+        if (!text) return configuredBoost;
+        const hasKana = /[\u3040-\u309F\u30A0-\u30FF]/.test(text);
+        const hasHangul = /[\uAC00-\uD7AF]/.test(text);
+        const hasHan = /[\u4E00-\u9FFF]/.test(text);
+        if (configuredBoost === 'Japanese' && hasHan && !hasKana) return 'Chinese';
+        if (configuredBoost === 'Korean'   && hasHan && !hasHangul) return 'Chinese';
+        return configuredBoost;
     }
 
     function _getMiniMaxTextEndpoints(groupId) {
@@ -170,7 +230,22 @@
     }
 
     function _stripThinkBlocks(text) {
-        return String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+        let s = String(text || '');
+        // 1) 成对闭合的 <think>...</think>
+        s = s.replace(/<think>[\s\S]*?<\/think>/gi, '');
+        // 2) 被 max_tokens 截断、没有结束标签的 <think>（推理模型常见）——
+        //    从第一个未闭合的 <think> 一直删到结尾
+        s = s.replace(/<think>[\s\S]*$/i, '');
+        // 3) 清掉残留的孤立标签
+        s = s.replace(/<\/?think>/gi, '');
+        return s.trim();
+    }
+
+    // 判断清洗后的文本是不是“没翻译成功”的垃圾（含标签残留 / 仍是空）
+    function _looksLikeBadTranslation(text) {
+        if (!text || !text.trim()) return true;
+        if (/<\/?think>/i.test(text)) return true;   // 还残留 think 标签
+        return false;
     }
 
     function _cleanTranslatedText(text) {
@@ -223,20 +298,33 @@
     }
 
     async function translateToJapanese(text) {
-        const { minimaxKey, groupId, targetLang } = _getConfig();
+        const { minimaxKey, groupId, targetLang, gender, styleText, translateModel } = _getConfig();
         if (!minimaxKey) throw new Error('请先填写 MiniMax API Key');
         const lang = targetLang || 'JA';
+        const translateModelName = translateModel || DEFAULT_TRANSLATE_MODEL;
+
+        // 原文直传，跳过翻译
+        if (lang === 'RAW') return String(text || '').trim();
+
         const langInfo = _getLangInfo(lang);
         const sourceText = String(text || '').trim();
         if (!sourceText) return '';
 
-        const cacheKey = [sourceText, lang].join('|');
+        // 动态生成 instruction（性别 + 自定义风格）
+        const genderInstruction = _getGenderInstruction(lang, gender || 'male');
+        const styleInstruction = styleText ? `The character's speaking style: ${styleText}.` : '';
+        const dynamicLangInfo = {
+            ...langInfo,
+            instruction: [genderInstruction, styleInstruction].filter(Boolean).join(' ')
+        };
+
+        const cacheKey = [sourceText, lang, gender || 'male', styleText || ''].join('|');
         if (_translationCache[cacheKey]) return _translationCache[cacheKey];
         if (_translationPending[cacheKey]) return _translationPending[cacheKey];
 
         _translationPending[cacheKey] = (async () => {
             const body = {
-                model: DEFAULT_TRANSLATE_MODEL,
+                model: translateModelName,
                 stream: false,
                 max_completion_tokens: TRANSLATE_MAX_TOKENS,
                 temperature: 0,
@@ -250,7 +338,7 @@
                     {
                         role: 'user',
                         name: 'source_text',
-                        content: _buildTranslationPrompt(langInfo, sourceText)
+                        content: _buildTranslationPrompt(dynamicLangInfo, sourceText)
                     }
                 ]
             };
@@ -258,16 +346,18 @@
             const data = await _postMiniMaxText(body, minimaxKey, groupId);
             let translated = _cleanTranslatedText(_extractMiniMaxContent(data));
 
-            // 返回空时重试一次，提高 temperature 让模型更愿意输出
-            if (!translated) {
-                console.warn('[voice-tts] 翻译返回为空，重试一次...');
+            // 返回空 / 仍是垃圾（含 think 残留）时重试一次，并给更高 temperature
+            if (_looksLikeBadTranslation(translated)) {
+                console.warn('[voice-tts] 翻译异常（空或含推理残留），重试一次...');
                 const retryBody = { ...body, temperature: 0.3 };
                 const retryData = await _postMiniMaxText(retryBody, minimaxKey, groupId);
                 translated = _cleanTranslatedText(_extractMiniMaxContent(retryData));
             }
 
-            if (!translated) {
-                console.warn('[voice-tts] 重试后仍为空，使用原文');
+            // 重试后仍不可用 → 回退到原文。
+            // 用户已验证：MiniMax 能直接朗读原始中文，所以原文是安全兜底。
+            if (_looksLikeBadTranslation(translated)) {
+                console.warn('[voice-tts] 重试后翻译仍不可用，回退使用原文朗读');
                 return sourceText;
             }
             return lang === 'JA' ? _adjustTone(translated) : translated;
@@ -297,6 +387,16 @@
         if (!minimaxKey || !groupId || !voiceId) throw new Error('未配置 MiniMax Key、Group ID 或 Voice ID');
         const modelName = model || DEFAULT_TTS_MODEL;
 
+        // 注意：speed 故意不传给 MiniMax（写死 1.0）。
+        // 原因：MiniMax 的 speed 参数会变调（高速变高音 / 慢速变低音）。
+        // 我们改用浏览器 audio.playbackRate（默认 preservesPitch=true）做客户端变速，
+        // 保证音调稳定，且换速度不需要重新生成。
+
+        // 优先用配置语言，但用文本内容做一次校正——
+        // 如果文本明显是中文而 boost 仍指向日/韩，就改成 Chinese
+        const configuredBoost = _getTtsLanguageBoost(targetLang || 'JA');
+        const languageBoost = _detectActualLangBoost(translatedText, configuredBoost);
+
         const res = await fetch(`https://api.minimax.chat/v1/t2a_v2?GroupId=${encodeURIComponent(groupId)}`, {
             method: 'POST',
             headers: {
@@ -307,7 +407,7 @@
                 model: modelName,
                 text: translatedText,
                 stream: false,
-                language_boost: _getTtsLanguageBoost(targetLang || 'JA'),
+                language_boost: languageBoost,
                 output_format: 'hex',
                 voice_setting: {
                     voice_id: voiceId,
@@ -336,17 +436,109 @@
         return _hexToAudioUrl(data?.data?.audio, 'MiniMax TTS 返回数据异常');
     }
 
+    // ─────────── 播放速度（客户端）───────────
+    // 用 audio.playbackRate 实现「变速不变调」。
+    // playbackRate 改 0.5–2.0 在所有现代浏览器里都默认保留音调（preservesPitch=true）。
+    function _readSpeedFromConfig() {
+        const v = _getConfig().speed;
+        if (v === undefined || v === null || v === '') return 1.0;
+        const n = Number(v);
+        if (!isFinite(n)) return 1.0;
+        return Math.max(0.5, Math.min(2.0, n));
+    }
+
+    function getPlaybackSpeed() {
+        return _readSpeedFromConfig();
+    }
+
+    function applyPlaybackSettings(audioEl, explicitSpeed) {
+        if (!audioEl) return;
+        const rate = (explicitSpeed === undefined || explicitSpeed === null)
+            ? _readSpeedFromConfig()
+            : Math.max(0.5, Math.min(2.0, Number(explicitSpeed) || 1.0));
+        // 显式打开保留音调，覆盖所有浏览器前缀
+        try { audioEl.preservesPitch = true; } catch (_) {}
+        try { audioEl.mozPreservesPitch = true; } catch (_) {}
+        try { audioEl.webkitPreservesPitch = true; } catch (_) {}
+        audioEl.playbackRate = rate;
+    }
+
+    // ─────────── 试听：用表单当前值（未保存）合成一段测试句 ───────────
+    // 不读 localStorage、不写 localStorage、不进缓存——避免污染正式配置。
+    async function previewWithConfig(overrideCfg) {
+        const cfg = overrideCfg || {};
+        const { minimaxKey, groupId, voiceId, model, targetLang } = cfg;
+        if (!minimaxKey || !groupId || !voiceId) throw new Error('请先填写 MiniMax Key、Group ID 和 Voice ID');
+
+        const TEST_TEXT = {
+            RAW: '你好，这是一段语音试听，可以听一下当前的音色和语速效果。',
+            JA:  'こんにちは、これは音声テストです。音色と速度を確認してみてください。',
+            EN:  'Hello, this is a voice preview. Use it to check the current tone and speed.',
+            KO:  '안녕하세요, 이것은 음성 미리듣기입니다. 현재 음색과 속도를 확인해 보세요.',
+            DE:  'Hallo, dies ist eine Sprachvorschau. Prüfen Sie Klang und Geschwindigkeit.'
+        };
+        const lang = targetLang || 'RAW';
+        const text = TEST_TEXT[lang] || TEST_TEXT.RAW;
+        const modelName = model || DEFAULT_TTS_MODEL;
+        const langBoost = _detectActualLangBoost(text, _getTtsLanguageBoost(lang));
+
+        const res = await fetch(`https://api.minimax.chat/v1/t2a_v2?GroupId=${encodeURIComponent(groupId)}`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${minimaxKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: modelName,
+                text,
+                stream: false,
+                language_boost: langBoost,
+                output_format: 'hex',
+                voice_setting: { voice_id: voiceId, speed: 1.0, vol: 1.0, pitch: 0 },
+                audio_setting: { sample_rate: 32000, bitrate: 128000, format: 'mp3', channel: 1 }
+            })
+        });
+        if (!res.ok) {
+            const err = await res.text();
+            throw new Error(`试听失败 (${res.status}): ${err}`);
+        }
+        const data = await res.json();
+        if (data?.base_resp && Number(data.base_resp.status_code || 0) !== 0) {
+            throw new Error(`试听失败：${data.base_resp.status_msg || data.base_resp.status_code}`);
+        }
+        return _hexToAudioUrl(data?.data?.audio, '试听返回数据异常');
+    }
+
     // ─────────── 主入口：翻译 + TTS（带缓存）───────────
+    // 简单的字符串哈希（FNV-1a 32bit），用于把文本内容纳入缓存键，
+    // 避免「相同 msgId、不同文本」时取到旧脏数据。
+    function _hashText(s) {
+        s = String(s || '');
+        let h = 0x811c9dc5;
+        for (let i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i);
+            h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+        }
+        return h.toString(36);
+    }
+
     async function getAudioForMessage(msgId, chineseText) {
         const { voiceId, model, targetLang } = _getConfig();
-        const cacheKey = [msgId || chineseText, voiceId || '', model || DEFAULT_TTS_MODEL, targetLang || 'JA'].join('|');
+        const textHash = _hashText(chineseText);
+        const cacheKey = [
+            msgId || chineseText,
+            textHash,                       // ← 关键：文本内容指纹
+            voiceId || '',
+            model || DEFAULT_TTS_MODEL,
+            targetLang || 'JA'
+        ].join('|');
         if (_audioCache[cacheKey]) return _audioCache[cacheKey];
         if (_audioPending[cacheKey]) return _audioPending[cacheKey];
 
         _audioPending[cacheKey] = (async () => {
             const translatedText = await translateToJapanese(chineseText);
             const blobUrl = await generateSpeech(translatedText);
-            _audioCache[cacheKey] = blobUrl;
+            _setAudioCache(cacheKey, blobUrl);
             return blobUrl;
         })();
 
@@ -461,6 +653,20 @@
         cloneVoice,
         previewClonedVoice,
         translateToJapanese,
+        // 新增：客户端语速 / 试听
+        getPlaybackSpeed,
+        applyPlaybackSettings,
+        previewWithConfig,
+        clearMemoryCache: () => {
+            // 清翻译缓存
+            Object.keys(_translationCache).forEach(k => delete _translationCache[k]);
+            // 清音频缓存（释放 blob URL）
+            Object.keys(_audioCache).forEach(k => {
+                URL.revokeObjectURL(_audioCache[k]);
+                delete _audioCache[k];
+            });
+            _audioCacheOrder.length = 0;
+        },
         _getAudioCache: (msgId) => {
             const cfg = _getConfig();
             const cacheKey = [msgId, cfg.voiceId || '', cfg.model || DEFAULT_TTS_MODEL, cfg.targetLang || 'JA'].join('|');
